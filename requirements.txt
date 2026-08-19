@@ -1,0 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+torch
+torchvision
+transformers
+accelerate
+pillow
+onnxruntime-gpu
+huggingface-hub
+onnxruntime-gpu
