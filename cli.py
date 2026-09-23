@@ -30,11 +30,6 @@ MAX_OBSERVATION_ATTEMPTS = 5
 # Broad enough to help Qwen, but do not feed demographic guesses back into it.
 WD14_THRESHOLD = 0.35
 WD14_MAX_TAGS = 45
-WD14_BLOCKED_HINTS = {
-    "1girl", "1boy", "2girls", "2boys", "multiple girls", "multiple boys",
-    "asian", "caucasian", "white", "black person", "african", "hispanic",
-    "latina", "latino", "middle eastern", "arab", "closed eyes",
-}
 RUN_LOG_FILENAME = "_run_log.csv"
 
 SEX_VALUES = {"unknown", "female", "male"}
@@ -244,8 +239,6 @@ def wd14_tags(path: Path, runtime: WD14Runtime) -> list[WD14Tag]:
         if runtime.categories[i] != 0 or float(prob) < WD14_THRESHOLD:
             continue
         readable = runtime.names[i].replace("_", " ").strip()
-        if readable.casefold() in WD14_BLOCKED_HINTS:
-            continue
         tags.append(WD14Tag(readable, float(prob), int(runtime.categories[i])))
     tags.sort(key=lambda x: x.probability, reverse=True)
     return tags[:WD14_MAX_TAGS]
