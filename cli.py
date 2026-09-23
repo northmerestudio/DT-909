@@ -9,7 +9,7 @@ import os
 import re
 import time
 from collections import Counter
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from collections.abc import Sequence
 from typing import Any
@@ -30,6 +30,12 @@ MAX_OBSERVATION_ATTEMPTS = 5
 # Broad enough to help Qwen, but do not feed demographic guesses back into it.
 WD14_THRESHOLD = 0.35
 WD14_MAX_TAGS = 45
+WD14_BLOCKED_HINTS = {
+    "1girl", "1boy", "2girls", "2boys", "multiple girls", "multiple boys",
+    "asian", "caucasian", "white", "black person", "african", "hispanic",
+    "latina", "latino", "middle eastern", "arab", "closed eyes",
+}
+RUN_LOG_FILENAME = "_run_log.csv"
 
 SEX_VALUES = {"unknown", "female", "male"}
 AGE_VALUES = {"unknown", "young adult", "mature adult", "elderly adult"}
@@ -77,14 +83,12 @@ class Observation:
     eye_color: str = "unknown"
     figure: str = "unknown"
     chest_size: str = "unknown"
-
     face_clear: bool = False
     hair_visible: bool = False
     skin_visible: bool = False
     eyes_clear: bool = False
     body_build_visible: bool = False
     chest_visible: bool = False
-
     # These are full factual sentences about this frame only. They must not
     # contain stable identity attributes; those are rendered deterministically.
     subject_action: str = ""
@@ -94,7 +98,6 @@ class Observation:
     scene: str = ""
     camera: str = ""
     lighting: str = ""
-
     skin_features: list[str] = field(default_factory=list)
 
 
@@ -109,7 +112,6 @@ class Consensus:
     eye_color: str = "unknown"
     figure: str = "unknown"
     chest_size: str = "unknown"
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +131,7 @@ class QwenRuntime:
 def find_images(directory: Path) -> list[Path]:
     return sorted(
         path
-        for path in directory.iterdir()
+        for path in directory.rglob("*")
         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
     )
 
@@ -150,7 +152,6 @@ def load_wd14() -> WD14Runtime:
 
     model_path = hf_hub_download(WD14_MODEL_ID, "model.onnx")
     labels_path = hf_hub_download(WD14_MODEL_ID, "selected_tags.csv")
-
     names: list[str] = []
     categories: list[int] = []
     with Path(labels_path).open(newline="", encoding="utf-8") as file:
@@ -158,7 +159,6 @@ def load_wd14() -> WD14Runtime:
         for row in reader:
             names.append(row["name"])
             categories.append(int(row["category"]))
-
     available_providers = ort.get_available_providers()
     providers = (
         ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -186,7 +186,6 @@ def load_oriented_rgb(path: Path) -> Image.Image:
 
         width, height = image.size
         pixels = width * height
-
         # Downscale to the 1 MP budget first.
         if pixels > max_pixels:
             scale = (max_pixels / pixels) ** 0.5
@@ -196,7 +195,6 @@ def load_oriented_rgb(path: Path) -> Image.Image:
         # Align dimensions to Qwen's 32-pixel spatial grid.
         width = max(step, round(width / step) * step)
         height = max(step, round(height / step) * step)
-
         # Rounding to 32 can push us slightly above the pixel budget.
         # If so, step the larger dimension down until we are <= 1 MP.
         while width * height > max_pixels:
@@ -213,6 +211,7 @@ def load_oriented_rgb(path: Path) -> Image.Image:
 
         return image
 
+
 def prepare_wd14_image(path: Path, size: int) -> np.ndarray:
     # Match WD14's reference preprocessing: apply EXIF orientation, composite
     # transparency onto white, square-pad on white, resize with bicubic, then BGR.
@@ -225,7 +224,6 @@ def prepare_wd14_image(path: Path, size: int) -> np.ndarray:
             image = Image.alpha_composite(background, rgba).convert("RGB")
         else:
             image = image.convert("RGB")
-
     w, h = image.size
     side = max(w, h)
     square = Image.new("RGB", (side, side), (255, 255, 255))
@@ -241,19 +239,23 @@ def wd14_tags(path: Path, runtime: WD14Runtime) -> list[WD14Tag]:
     inp = runtime.session.get_inputs()[0]
     out = runtime.session.get_outputs()[0]
     probs = runtime.session.run([out.name], {inp.name: image})[0][0]
-
     tags: list[WD14Tag] = []
     for i, prob in enumerate(probs):
         if runtime.categories[i] != 0 or float(prob) < WD14_THRESHOLD:
             continue
         readable = runtime.names[i].replace("_", " ").strip()
+        if readable.casefold() in WD14_BLOCKED_HINTS:
+            continue
         tags.append(WD14Tag(readable, float(prob), int(runtime.categories[i])))
     tags.sort(key=lambda x: x.probability, reverse=True)
     return tags[:WD14_MAX_TAGS]
 
 
 def format_wd14(tags: list[WD14Tag]) -> str:
-    return ", ".join(f"{t.name} [{t.probability:.2f}]" for t in tags)
+    return ", ".join(
+        f"{t.name} [{t.probability:.2f}]"
+        for t in tags
+    )
 
 
 # --------------------------- Qwen -----------------------------------------
@@ -268,7 +270,6 @@ def load_qwen() -> QwenRuntime:
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Loading: {MODEL_ID}")
     print(f"dtype: {dtype}")
-
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     model = AutoModelForMultimodalLM.from_pretrained(
         MODEL_ID,
@@ -287,7 +288,6 @@ No markdown, explanation, or extra text.
 Return every key exactly once, even when the value is "unknown", false, [], or "".
 
 GENERAL RULES
-
 - Describe only facts visually supported by this image.
 - Use "unknown" for unsupported structured attributes and an empty string for unsupported free-text fields.
 - Do not infer names, ethnicity/race, nationality, exact age, exact measurements, or off-frame details.
@@ -297,7 +297,6 @@ GENERAL RULES
 - Do not describe the same fact in multiple free-text fields.
 - Free-text fields should be concise factual sentences, with at most one sentence per field.
 - In free-text fields, refer to the main person as "The subject" when grammatically the subject, "the subject" when grammatically the object, and "The subject's"/"the subject's" for possession. Do not use personal pronouns; Python renders them later.
-
 VISIBILITY RULES
 
 - sex describes the visibly presented adult subject only.
@@ -305,19 +304,16 @@ VISIBILITY RULES
 
 - face_clear=true only when the face is clear enough to estimate age_range.
   Otherwise age_range="unknown".
-
 - hair_visible=true only when scalp hair is sufficiently visible. Only scalp hair counts; facial and body hair do not.
   Otherwise hair_length, hair_texture, and hair_color must be "unknown". When hair_visible=true, judge hair_length, hair_texture, and hair_color independently; any individual attribute may still be "unknown".
 
 - skin_visible=true only when enough skin is visible to judge skin_tone.
   Otherwise skin_tone="unknown".
-
 - eyes_clear=true only when the irises are clear enough to judge eye_color. Judge the iris itself, not pupil darkness, reflections, eyelashes, or eyelid shadow; open eyes alone do not make eyes_clear=true.
   Otherwise eye_color="unknown" and do not infer gaze from the eyes.
 
 - body_build_visible=true only when enough of the torso/body silhouette is visible to judge figure.
   Otherwise figure="unknown".
-
 - chest_visible=true only when the chest area is clearly visible enough to estimate size.
   Otherwise chest_size="unknown".
 
@@ -328,7 +324,6 @@ Write one complete sentence beginning with "The subject" when grammatically appr
 Describe overall pose, body orientation, major limb posture, and head/face direction.
 Do not describe eye gaze here; eye gaze belongs only in expression_gaze.
 Do not describe clothing or detailed hand/foot positions here.
-
 expression_gaze:
 Describe visible facial expression.
 Describe gaze only when eyes_clear=true and iris direction is visually reliable.
@@ -336,7 +331,6 @@ Describe gaze only when eyes_clear=true and iris direction is visually reliable.
 clothing_accessories:
 Describe visible clothing, accessories, makeup, piercings, and tattoos.
 Do not infer clothing outside the crop.
-
 hands_feet:
 Describe directly visible hand and foot positions.
 Do not infer contact with an object or surface unless the contact is visibly clear.
@@ -346,7 +340,6 @@ scene:
 Describe only background objects, environment, and clearly visible spatial relationships.
 Do not repeat the subject's pose or appearance details.
 Leave empty if there is nothing useful to describe.
-
 camera:
 Describe clearly supported viewpoint, angle, crop, and framing.
 Do not guess an angle or shot-size label when ambiguous.
@@ -355,7 +348,6 @@ Use "full-body" only when the subject is continuously visible from head through 
 lighting:
 Describe visible illumination and shadows.
 Do not infer a light source unless the source itself is visible, and do not speculate with words such as "likely" or "probably" about an unseen source.
-
 skin_features:
 Include only visible localized skin marks such as freckles, moles, or scars.
 Entries must be concise noun phrases suitable after the word "include", such as "freckles on the shoulders" or "a mole on the left hip", not sentences.
@@ -368,7 +360,6 @@ unknown | female | male
 
 age_range:
 unknown | young adult | mature adult | elderly adult
-
 hair_length:
 unknown | bald | shaved | short | chin-length | shoulder-length | medium-length | long | waist-length
 
@@ -386,7 +377,6 @@ unknown | amber | black | blue | brown | gray | green | hazel
 
 figure:
 unknown | thin | average | curvy | fat
-
 chest_size:
 unknown | small | medium | large
 
@@ -411,7 +401,6 @@ OUTPUT SCHEMA
   "chest_visible": false,
 
   "skin_features": [],
-
   "subject_action": "",
   "expression_gaze": "",
   "clothing_accessories": "",
@@ -452,6 +441,7 @@ def _bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().casefold() == "true"
     return False
+
 
 def _sentence(value: Any) -> str:
     s = " ".join(str(value or "").split()).strip()
@@ -502,7 +492,6 @@ def parse_observation(data: dict[str, Any]) -> Observation:
             seen_features.add(key)
             cleaned_features.append(feature)
         obs.skin_features = cleaned_features[:4]
-
     # Visibility is authoritative. This prevents a model from returning a value
     # while simultaneously saying the relevant feature is not visible.
     if not obs.face_clear:
@@ -517,7 +506,6 @@ def parse_observation(data: dict[str, Any]) -> Observation:
         obs.figure = "unknown"
     if not obs.chest_visible:
         obs.chest_size = "unknown"
-
     return obs
 
 
@@ -553,14 +541,24 @@ def observation_detail_score(obs: Observation) -> int:
     return int(score)
 
 
-def analyze_image(path: Path, tags: list[WD14Tag], qwen: QwenRuntime) -> Observation:
+def analyze_image(
+    path: Path,
+    tags: list[WD14Tag],
+    qwen: QwenRuntime,
+    log: dict[str, str] | None = None,
+) -> Observation:
     model, processor = qwen.model, qwen.processor
     tag_text = format_wd14(tags)
+    if log is not None:
+        log["wd14_tags"] = json.dumps(
+            [{"name": t.name, "probability": round(t.probability, 4)} for t in tags],
+            ensure_ascii=False,
+        )
+        log["wd14_hints"] = tag_text
     prompt = OBSERVATION_PROMPT + (
         f"\n\nNon-demographic WD14 hints (untrusted):\n{tag_text}"
         if tag_text else ""
     )
-
     oriented_image = load_oriented_rgb(path)
     messages = [{
         "role": "user",
@@ -578,7 +576,6 @@ def analyze_image(path: Path, tags: list[WD14Tag], qwen: QwenRuntime) -> Observa
         return_tensors="pt",
         enable_thinking=False,
     )
-
     input_device = model.get_input_embeddings().weight.device
     inputs = inputs.to(input_device)
     input_tokens = inputs["input_ids"].shape[-1]
@@ -588,7 +585,6 @@ def analyze_image(path: Path, tags: list[WD14Tag], qwen: QwenRuntime) -> Observa
     try:
         for attempt in range(1, MAX_OBSERVATION_ATTEMPTS + 1):
             started = time.perf_counter()
-
             try:
                 generation = dict(
                     max_new_tokens=1280,
@@ -603,7 +599,6 @@ def analyze_image(path: Path, tags: list[WD14Tag], qwen: QwenRuntime) -> Observa
                     end="",
                     flush=True,
                 )
-
                 with torch.inference_mode():
                     ids = model.generate(**inputs, **generation)
 
@@ -616,18 +611,20 @@ def analyze_image(path: Path, tags: list[WD14Tag], qwen: QwenRuntime) -> Observa
                     clean_up_tokenization_spaces=False,
                 )
                 del ids, generated_ids
-
+                if log is not None:
+                    log["qwen_response"] = raw
                 obs = parse_observation(_json_object(raw))
                 if not obs.subject_action:
                     raise ValueError("required subject_action missing")
 
+                if log is not None:
+                    log["observation"] = json.dumps(asdict(obs), ensure_ascii=False)
                 score = observation_detail_score(obs)
                 print(
                     f" done in {elapsed:.1f}s "
                     f"(attributes={score})"
                 )
                 return obs
-
             except Exception as exc:
                 elapsed = time.perf_counter() - started
                 last_error = exc
@@ -652,7 +649,6 @@ def winner(values: Sequence[str], minimum_support: int = 2, minimum_share: float
     known_values = [value for value in values if value != "unknown"]
     if not known_values:
         return "unknown"
-
     value, support = Counter(known_values).most_common(1)[0]
     share = support / len(known_values)
     if support < minimum_support or share < minimum_share:
@@ -670,7 +666,6 @@ def neighborhood_winner(
     minimum_direct_share: float = 0.10,
 ) -> str:
     """Choose a representative value on an ordered scale.
-
     Votes support their own category fully, an adjacent category partly, and a
     category two steps away weakly. The winner must still have meaningful direct
     support, so a scarcely observed middle label cannot win merely by sitting
@@ -679,13 +674,11 @@ def neighborhood_winner(
     known_values = [value for value in values if value in order]
     if not known_values:
         return "unknown"
-
     counts = Counter(known_values)
     minimum_direct = max(
         minimum_support,
         math.ceil(len(known_values) * minimum_direct_share),
     )
-
     scores: dict[str, float] = {}
     for candidate_index, candidate in enumerate(order):
         score = 0.0
@@ -701,7 +694,6 @@ def neighborhood_winner(
                 weight = 0.0
             score += count * weight
         scores[candidate] = score
-
     ranked = sorted(
         order,
         key=lambda value: (-scores[value], -counts[value], order.index(value)),
@@ -719,7 +711,6 @@ def hair_length_winner(values: Sequence[str]) -> str:
 
     counts = Counter(known_values)
     scalp_state_support = counts["bald"] + counts["shaved"]
-
     # Bald/shaved are scalp states, not neighboring hair lengths. Only let that
     # family win when it represents a clear share of the usable observations.
     if scalp_state_support / len(known_values) >= 0.50:
@@ -735,7 +726,6 @@ def hair_color_winner(values: Sequence[str]) -> str:
     known_values = [value for value in values if value != "unknown"]
     if not known_values:
         return "unknown"
-
     counts = Counter(known_values)
     family_scores = [
         sum(counts[value] for value in family)
@@ -744,14 +734,12 @@ def hair_color_winner(values: Sequence[str]) -> str:
     best_family_index = max(range(len(family_scores)), key=family_scores.__getitem__)
     family = HAIR_COLOR_FAMILIES[best_family_index]
     family_support = family_scores[best_family_index]
-
     # If no color family clearly dominates, do not force unrelated hues onto a
     # single ordered scale.
     if family_support / len(known_values) < 0.60:
         return winner(known_values, minimum_share=0.55)
 
     family_values = [value for value in known_values if value in family]
-
     # On the natural black->blonde axis, two strong labels separated by exactly
     # one missing intermediate label can indicate a stable in-between color.
     # Example: repeated brown + blonde observations can reasonably support
@@ -766,7 +754,6 @@ def hair_color_winner(values: Sequence[str]) -> str:
             combined = first_count + second_count
             weaker = min(first_count, second_count)
             middle = family[i + 1] if j - i == 2 else None
-
             if (
                 middle is not None
                 and combined / len(family_values) >= 0.70
@@ -791,7 +778,6 @@ def chest_size_winner(observations: Sequence[Observation]) -> str:
     return neighborhood_winner(values, CHEST_SIZE_ORDER)
 
 
-
 def usable_eye_observations(
     observations: Sequence[Observation],
 ) -> list[Observation]:
@@ -803,7 +789,6 @@ def usable_eye_observations(
     ]
     if not usable:
         return []
-
     bad_light_terms = (
         "colored light", "colored lighting", "neon",
         "red light", "blue light", "green light", "purple light",
@@ -828,7 +813,6 @@ def eye_color_winner(observations: Sequence[Observation]) -> str:
     color, support = ranked[0]
     total = len(chosen)
     runner_up = ranked[1][1] if len(ranked) > 1 else 0
-
     if support < 2 or support / total < 0.60:
         return "unknown"
     if (support - runner_up) / total < 0.15:
@@ -856,9 +840,7 @@ def build_consensus(observations: Sequence[Observation]) -> Consensus:
     hair_color_values = _visible_values(observations, "hair_color", "hair_visible")
     skin_tone_values = _visible_values(observations, "skin_tone", "skin_visible")
     figure_values = _visible_values(observations, "figure", "body_build_visible")
-
     age_range = neighborhood_winner(age_values, AGE_ORDER)
-
     return Consensus(
         sex=winner(_visible_values(observations, "sex")),
         age_range=age_range,
@@ -904,7 +886,6 @@ def apply_consensus(
     updates: dict[str, Any] = {
         "skin_features": list(obs.skin_features),
     }
-
     # Thresholds control propagation, not whether a dataset-level consensus can
     # be displayed. Weak or derived consensus therefore does not overwrite good
     # per-image observations.
@@ -919,7 +900,6 @@ def apply_consensus(
         "figure": ("body_build_visible", 0.65),
         "chest_size": ("chest_visible", 0.65),
     }
-
     for field_name, (visibility_field, minimum_share) in propagation.items():
         value = getattr(consensus, field_name)
         if value == "unknown":
@@ -928,7 +908,6 @@ def apply_consensus(
             continue
         if field_name.startswith("hair_") and getattr(obs, field_name) == "unknown":
             continue
-
         share = _direct_consensus_share(
             observations,
             field_name,
@@ -954,7 +933,6 @@ def apply_subject_pronouns(text: str, obs: Observation) -> str:
     """Replace prompt-safe subject placeholders with grammatical pronouns."""
     if not text:
         return ""
-
     _, subject, object_, possessive = subject_words(obs)
 
     def preserve_case(word: str, original: str) -> str:
@@ -967,11 +945,9 @@ def apply_subject_pronouns(text: str, obs: Observation) -> str:
         text,
         flags=re.IGNORECASE,
     )
-
     # Prompt convention: capitalized = grammatical subject, lowercase = object.
     text = re.sub(r"\bThe subject\b", subject.capitalize(), text)
     text = re.sub(r"\bthe subject\b", object_, text)
-
     # Small fallback if the model leaks pronouns despite the prompt.
     if obs.sex != "unknown":
         text = re.sub(
@@ -992,12 +968,12 @@ def apply_subject_pronouns(text: str, obs: Observation) -> str:
             text,
             flags=re.IGNORECASE,
         )
-
     # Fix the common plural-verb leak after singular pronoun substitution.
     if obs.sex in {"female", "male"}:
         text = re.sub(r"\b([Ss]he|[Hh]e)\s+are\b", r"\1 is", text)
 
     return text
+
 
 def hair_phrase(obs: Observation) -> str:
     parts = [x for x in (obs.hair_length, obs.hair_texture, obs.hair_color) if x != "unknown"]
@@ -1019,11 +995,9 @@ def identity_sentence(obs: Observation) -> str:
             if obs.figure == "average"
             else f"a {obs.figure} figure"
         )
-
     _, subject, _, possessive = subject_words(obs)
     subject_cap = subject.capitalize()
     possessive_cap = possessive.capitalize()
-
     sentences: list[str] = []
     if obs.age_range != "unknown":
         sentences.append(f"{subject_cap} is a {obs.age_range}.")
@@ -1097,7 +1071,6 @@ def render_caption(obs: Observation) -> str:
             continue
         seen.add(key)
         clean_parts.append(part)
-
     text = " ".join(clean_parts)
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -1114,13 +1087,11 @@ def _consensus_summary_line(
     known_values = [value for value in values if value != "unknown"]
     counts = Counter(known_values)
     eligible = len(known_values)
-
     display_value = (
         consensus_value.title()
         if title_value and consensus_value != "unknown"
         else ("Unknown" if consensus_value == "unknown" else consensus_value)
     )
-
     if not eligible:
         agreement = "[0/0, 0%]"
         votes = ""
@@ -1138,7 +1109,6 @@ def _consensus_summary_line(
             support = max(counts.values())
             share = support / eligible
             agreement = f"[{support}/{eligible}, {share:.0%}]"
-
         # Only print the vote spread when observations disagree.
         if len(counts) > 1:
             ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
@@ -1169,7 +1139,6 @@ def format_summary(c: Consensus, observations: Sequence[Observation]) -> str:
             False,
         ),
     )
-
     lines: list[str] = []
     for label, value_attr, visibility_attr, title_value in rows:
         values = (
@@ -1188,25 +1157,49 @@ def format_summary(c: Consensus, observations: Sequence[Observation]) -> str:
     return "\n".join(lines)
 
 
-
 def analyze_directory(
     images: list[Path],
     wd14: WD14Runtime,
     qwen: QwenRuntime,
-) -> tuple[dict[Path, Observation], int]:
+) -> tuple[dict[Path, Observation], int, dict[Path, dict[str, str]]]:
     observations: dict[Path, Observation] = {}
+    logs: dict[Path, dict[str, str]] = {}
     failures = 0
 
     for i, path in enumerate(images, 1):
         print(f"[{i}/{len(images)}] {path.name}")
+        log = logs[path] = {"image": str(path)}
         try:
             tags = wd14_tags(path, wd14)
-            observations[path] = analyze_image(path, tags, qwen)
+            observations[path] = analyze_image(path, tags, qwen, log)
+            log["status"] = "ok"
         except Exception as exc:
             failures += 1
+            log["status"] = "failed"
+            log["error"] = f"{type(exc).__name__}: {exc}"
             print(f"FAILED: {exc}")
+    return observations, failures, logs
 
-    return observations, failures
+
+RUN_LOG_FIELDS = (
+    "image", "status", "wd14_tags", "wd14_hints", "qwen_response",
+    "observation", "final_observation", "caption", "error",
+)
+
+
+def write_run_log(directory: Path, logs: dict[Path, dict[str, str]]) -> None:
+    path = directory / RUN_LOG_FILENAME
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=RUN_LOG_FIELDS)
+            writer.writeheader()
+            writer.writerows(logs.values())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    print(f"Run log: {path}")
+
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -1234,7 +1227,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"No images found in {directory}")
         return 2
 
-
     # Fail before expensive work if outputs would collide.
     outputs = [path.with_suffix(".txt") for path in images]
     if len(set(outputs)) != len(outputs):
@@ -1246,9 +1238,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     qwen = load_qwen()
 
     try:
-        observations, failures = analyze_directory(images, wd14, qwen)
-
+        observations, failures, logs = analyze_directory(images, wd14, qwen)
         if not observations:
+            write_run_log(directory, logs)
             print("No images were successfully analyzed.")
             return 1
 
@@ -1258,11 +1250,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(format_summary(consensus, observation_values))
 
         for path, observation in observations.items():
-            caption = render_caption(apply_consensus(observation, consensus, observation_values))
+            final_observation = apply_consensus(observation, consensus, observation_values)
+            caption = render_caption(final_observation)
+            logs[path]["final_observation"] = json.dumps(
+                asdict(final_observation), ensure_ascii=False,
+            )
+            logs[path]["caption"] = caption
             output_path = path.with_suffix(".txt")
             atomic_write(output_path, caption)
             print(f"Saved {output_path.name} ({len(caption.split())} words)")
 
+        write_run_log(directory, logs)
         print(f"\nDone: {len(observations)} saved, {failures} analysis failures.")
         return int(failures > 0)
     finally:
